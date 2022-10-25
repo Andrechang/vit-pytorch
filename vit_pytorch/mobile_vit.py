@@ -1,3 +1,5 @@
+#from: https://github.com/lucidrains/vit-pytorch/blob/1bae5d3cc58448f05d1252be306bbf48d9c5fede/vit_pytorch/mobile_vit.py
+
 import torch
 import torch.nn as nn
 
@@ -20,6 +22,16 @@ def conv_nxn_bn(inp, oup, kernel_size=3, stride=1):
         nn.SiLU()
     )
 
+def depthconv_nxn_bn(inp, oup, kernal_size=3, stride=1):
+    return nn.Sequential(
+        nn.Conv2d(inp, inp, kernal_size, stride, 1, groups=inp, bias=False),
+        nn.BatchNorm2d(oup),
+        nn.SiLU(),
+        nn.Conv2d(inp, oup, kernel_size=1, bias=False),
+        nn.BatchNorm2d(oup),
+        nn.SiLU(),
+    )
+
 # classes
 
 class PreNorm(nn.Module):
@@ -30,7 +42,6 @@ class PreNorm(nn.Module):
 
     def forward(self, x, **kwargs):
         return self.fn(self.norm(x), **kwargs)
-
 
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.):
@@ -67,15 +78,53 @@ class Attention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(
             t, 'b p n (h d) -> b p h n d', h=self.heads), qkv)
-
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
         attn = self.attend(dots)
         attn = self.dropout(attn)
-
         out = torch.matmul(attn, v)
         out = rearrange(out, 'b p h n d -> b p n (h d)')
+        return self.to_out(out), attn
+
+class FC_attn(nn.Module):
+    def __init__(self, dim, dim_head=64, dropout=0.):
+        super().__init__()
+        self.to_v = nn.Linear(dim, dim_head, bias=False)
+        self.to_out = nn.Sequential(
+            nn.Linear(dim_head, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x, a):
+        v = self.to_v(x)
+        out = torch.matmul(a, v)
         return self.to_out(out)
+
+class PTransformer(nn.Module):
+    """Transformer block described in ViT.
+    Paper: https://arxiv.org/abs/2010.11929
+    Based on: https://github.com/lucidrains/vit-pytorch
+    """
+
+    def __init__(self, dim, depth, dim_head, mlp_dim, dropout=0.):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                nn.LayerNorm(dim),
+                FC_attn(dim, dim_head, dropout),
+                PreNorm(dim, FeedForward(dim, mlp_dim, dropout))
+            ]))
+
+    def forward(self, x, al):
+        """
+        al: List of tensor
+        """
+        print(len(al), al[0].shape)
+        for i, (norm, attn, ff) in enumerate(self.layers):
+            y = norm(x)
+            y = attn(y, al[i])
+            y = y + x
+            x = ff(y) + x
+        return x
 
 class Transformer(nn.Module):
     """Transformer block described in ViT.
@@ -93,10 +142,13 @@ class Transformer(nn.Module):
             ]))
 
     def forward(self, x):
+        al = []
         for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
-        return x
+            y, a = attn(x)
+            al.append(a)
+            y = y + x
+            x = ff(y) + x
+        return x, al
 
 class MV2Block(nn.Module):
     """MV2 block described in MobileNetV2.
@@ -105,10 +157,11 @@ class MV2Block(nn.Module):
     """
 
     def __init__(self, inp, oup, stride=1, expansion=4):
+        #expansion: hidden_dim expansion
         super().__init__()
         self.stride = stride
         assert stride in [1, 2]
-
+        # print('MV2Block', inp, oup, stride, expansion)
         hidden_dim = int(inp * expansion)
         self.use_res_connect = self.stride == 1 and inp == oup
 
@@ -146,7 +199,7 @@ class MV2Block(nn.Module):
         return out
 
 class MobileViTBlock(nn.Module):
-    def __init__(self, dim, depth, channel, kernel_size, patch_size, mlp_dim, dropout=0.):
+    def __init__(self, dim, depth, channel, kernel_size, patch_size, mlp_dim, dropout=0., channel_out=0, stride=1):
         super().__init__()
         self.ph, self.pw = patch_size
 
@@ -156,7 +209,10 @@ class MobileViTBlock(nn.Module):
         self.transformer = Transformer(dim, depth, 4, 8, mlp_dim, dropout)
 
         self.conv3 = conv_1x1_bn(dim, channel)
-        self.conv4 = conv_nxn_bn(2 * channel, channel, kernel_size)
+        if channel_out:
+            self.conv4 = conv_nxn_bn(2 * channel, channel_out, kernel_size, stride=stride)
+        else:
+            self.conv4 = conv_nxn_bn(2 * channel, channel, kernel_size)
 
     def forward(self, x):
         y = x.clone()
@@ -164,20 +220,102 @@ class MobileViTBlock(nn.Module):
         # Local representations
         x = self.conv1(x)
         x = self.conv2(x)
-
         # Global representations
         _, _, h, w = x.shape
         x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d',
                       ph=self.ph, pw=self.pw)
-        x = self.transformer(x)
+        x, _ = self.transformer(x)
         x = rearrange(x, 'b (ph pw) (h w) d -> b d (h ph) (w pw)',
                       h=h//self.ph, w=w//self.pw, ph=self.ph, pw=self.pw)
-
         # Fusion
         x = self.conv3(x)
         x = torch.cat((x, y), 1)
         x = self.conv4(x)
+
         return x
+
+class MobileViTBlock_v3(nn.Module):
+    def __init__(self, dim, depth, channel, kernel_size, patch_size, mlp_dim, dropout=0., channel_out=0, ret_att=False):
+        super().__init__()
+        # print('MobileViTBlock_v3', dim, depth, channel, kernel_size, patch_size, mlp_dim, dropout, channel_out, ret_att)
+        self.ph, self.pw = patch_size
+
+        self.conv1 = depthconv_nxn_bn(channel, channel, kernel_size)
+        self.conv2 = conv_1x1_bn(channel, dim)
+        self.ret_att = ret_att
+        self.transformer = Transformer(dim, depth, 4, 8, mlp_dim, dropout)
+        if channel_out != channel and channel_out > 0:
+            self.conv3 = conv_1x1_bn(channel, channel_out)
+            self.conv4 = conv_1x1_bn(2 * dim, channel_out)
+        else:
+            self.conv3 = None
+            self.conv4 = conv_1x1_bn(2 * dim, channel)
+
+    def forward(self, x):
+        y = x.clone()
+        # Local representations
+        x = self.conv1(x)
+        x = self.conv2(x)
+        # Global representations
+        _, _, h, w = x.shape
+        z = x.clone() #local rep
+
+
+
+        x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d',
+                      ph=self.ph, pw=self.pw)
+        x, attn = self.transformer(x)
+        x = rearrange(x, 'b (ph pw) (h w) d -> b d (h ph) (w pw)',
+                      h=h//self.ph, w=w//self.pw, ph=self.ph, pw=self.pw)
+        # Fusion
+        x = torch.cat((x, z), 1)
+        x = self.conv4(x)
+        if self.conv3:
+            y = self.conv3(y)
+        if self.ret_att:
+            return x + y, attn
+        else:
+            return x + y
+
+class MobileTransViTBlock(nn.Module):
+    def __init__(self, dim, depth, channel, kernel_size, patch_size, mlp_dim, dropout=0., channel_out=0, scale=2):
+        super().__init__()
+        self.ph, self.pw = patch_size
+
+        self.conv1 = depthconv_nxn_bn(channel, channel, kernel_size)
+        self.conv2 = conv_1x1_bn(channel, dim)
+        dim_head = 64
+        self.transformer = PTransformer(dim, depth, dim_head, mlp_dim, dropout)
+        if channel_out != channel and channel_out > 0:
+            self.conv3 = conv_1x1_bn(channel, channel_out)
+            self.conv4 = conv_1x1_bn(2 * dim, channel_out)
+        else:
+            self.conv3 = None
+            self.conv4 = conv_1x1_bn(2 * dim, channel)
+
+        self.up = nn.Upsample(None, scale, 'nearest')
+
+    def forward(self, x, attn):
+        y = x.clone()
+        # Local representations
+        x = self.conv1(x)
+        x = self.conv2(x)
+        # Global representations
+        _, _, h, w = x.shape
+        z = x.clone() #local rep
+        x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d',
+                      ph=self.ph, pw=self.pw)
+        x = self.transformer(x, attn)
+        x = rearrange(x, 'b (ph pw) (h w) d -> b d (h ph) (w pw)',
+                      h=h//self.ph, w=w//self.pw, ph=self.ph, pw=self.pw)
+        # Fusion
+        x = torch.cat((x, z), 1)
+        x = self.conv4(x)
+        if self.conv3:
+            y = self.conv3(y)
+        z = x + y
+        z = self.up(z)
+        return z
 
 class MobileViT(nn.Module):
     """MobileViT.
@@ -194,23 +332,27 @@ class MobileViT(nn.Module):
         expansion=4,
         kernel_size=3,
         patch_size=(2, 2),
-        depths=(2, 4, 3)
+        depths=(2, 4, 3),
+        conv1=None,
+        with_head=False,
     ):
         super().__init__()
         assert len(dims) == 3, 'dims must be a tuple of 3'
         assert len(depths) == 3, 'depths must be a tuple of 3'
+
+        mbvit_module = MobileViTBlock_v3
 
         ih, iw = image_size
         ph, pw = patch_size
         assert ih % ph == 0 and iw % pw == 0
 
         init_dim, *_, last_dim = channels
+        if conv1 is not None:
+            self.conv1 = conv1
+        else:
+            self.conv1 = conv_nxn_bn(3, init_dim, stride=2)
 
-        self.channels = channels
-        self.last_dim = last_dim
-        self.conv1 = conv_nxn_bn(3, init_dim, stride=2)
-
-        self.stem = nn.ModuleList([])
+        self.stem = nn.ModuleList([]) # resnet like backbone
         self.stem.append(MV2Block(channels[0], channels[1], 1, expansion))
         self.stem.append(MV2Block(channels[1], channels[2], 2, expansion))
         self.stem.append(MV2Block(channels[2], channels[3], 1, expansion))
@@ -219,27 +361,28 @@ class MobileViT(nn.Module):
         self.trunk = nn.ModuleList([])
         self.trunk.append(nn.ModuleList([
             MV2Block(channels[3], channels[4], 2, expansion),
-            MobileViTBlock(dims[0], depths[0], channels[5],
+            mbvit_module(dims[0], depths[0], channels[5],
                            kernel_size, patch_size, int(dims[0] * 2))
         ]))
 
         self.trunk.append(nn.ModuleList([
             MV2Block(channels[5], channels[6], 2, expansion),
-            MobileViTBlock(dims[1], depths[1], channels[7],
+            mbvit_module(dims[1], depths[1], channels[7],
                            kernel_size, patch_size, int(dims[1] * 4))
         ]))
-        l_stride = 1 if ih == 224 else 2 # for 224 or 256
+
         self.trunk.append(nn.ModuleList([
-            MV2Block(channels[7], channels[8], l_stride, expansion),
-            MobileViTBlock(dims[2], depths[2], channels[9],
+            MV2Block(channels[7], channels[8], 2, expansion),
+            mbvit_module(dims[2], depths[2], channels[9],
                            kernel_size, patch_size, int(dims[2] * 4))
         ]))
-
-        self.to_logits = nn.Sequential(
-            conv_1x1_bn(channels[-2], last_dim),
-            Reduce('b c h w -> b c', 'mean'),
-            nn.Linear(channels[-1], num_classes, bias=False)
-        )
+        self.with_head = with_head
+        if with_head:
+            self.to_logits = nn.Sequential(
+                conv_1x1_bn(channels[-2], last_dim),
+                Reduce('b c h w -> b c', 'mean'),
+                nn.Linear(channels[-1], num_classes, bias=False)
+            )
 
     def forward(self, x):
         x = self.conv1(x)
@@ -250,5 +393,32 @@ class MobileViT(nn.Module):
         for conv, attn in self.trunk:
             x = conv(x)
             x = attn(x)
+        if self.with_head:
+            x = self.to_logits(x)
+        return x
 
-        return self.to_logits(x)
+def mobilevit_xxs(num_classes):
+    dims = [64, 80, 96]
+    channels = [16, 16, 24, 24, 48, 48, 64, 64, 80, 80, 320]
+    return MobileViT((256, 256), dims, channels, num_classes=num_classes, expansion=4, with_head=True)
+
+if __name__ == "__main__":
+    import time
+    from thop import profile
+    model = mobilevit_xxs(10)
+    input_ = torch.randn((1, 3, 256, 256))
+    # layers = []
+    # layers.append(MV2Block(256, 128, 2))
+    # layers.append(MobileViTBlock(96, 2, 256, 3, (2, 2), int(96 * 2), channel_out=128, stride=1))
+    # layers.append(MobileViTBlock_v3(96, 2, 256, 3, (2, 2), int(96 * 2)))
+    # model = nn.Sequential(*layers)
+    model_out = model(input_)
+    macs, params = profile(model, inputs=(input_,)); print("encoder: macs, params: ", macs/(10**9), params)
+    model = model.to('cuda')
+    input_ = input_.to('cuda')
+    start = time.time()
+    # for i in range(1000):
+    #     model_out = model(input_)
+    # m = (time.time() - start) / 1000
+    # print("% s seconds" % (m))
+    print(model_out.shape)
