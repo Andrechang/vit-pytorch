@@ -114,3 +114,29 @@ class SimpleViT(nn.Module):
 
         x = self.to_latent(x)
         return self.linear_head(x)
+
+if __name__ == "__main__":
+    import time
+    from thop import profile
+
+    model = SimpleViT(
+        image_size=256,
+        patch_size=32,
+        num_classes=1000,
+        dim=1024,
+        depth=6,
+        heads=3,
+        mlp_dim=2048
+    )
+    input_ = torch.randn(1, 3, 256, 256)
+    model_out = model(input_)
+
+    macs, params = profile(model, inputs=(input_,)); print("encoder: macs, params: ", macs/(10**9), params)
+    model = model.to('cuda')
+    input_ = input_.to('cuda')
+    start = time.time()
+    # for i in range(1000):
+    #     model_out = model(input_)
+    # m = (time.time() - start) / 1000
+    # print("% s seconds" % (m))
+    print(model_out.shape)

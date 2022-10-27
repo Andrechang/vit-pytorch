@@ -34,15 +34,6 @@ def depthconv_nxn_bn(inp, oup, kernal_size=3, stride=1):
 
 # classes
 
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
-
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.):
         super().__init__()
@@ -75,6 +66,8 @@ class Attention(nn.Module):
         )
 
     def forward(self, x):
+        '''b (ph pw) (h w) d: batch, patch, imgsz, channel
+        b p h n d: batch, patch, head, imgsz, channel'''
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(
             t, 'b p n (h d) -> b p h n d', h=self.heads), qkv)
@@ -99,11 +92,6 @@ class FC_attn(nn.Module):
         return self.to_out(out)
 
 class PTransformer(nn.Module):
-    """Transformer block described in ViT.
-    Paper: https://arxiv.org/abs/2010.11929
-    Based on: https://github.com/lucidrains/vit-pytorch
-    """
-
     def __init__(self, dim, depth, dim_head, mlp_dim, dropout=0.):
         super().__init__()
         self.layers = nn.ModuleList([])
@@ -132,23 +120,21 @@ class Transformer(nn.Module):
     Based on: https://github.com/lucidrains/vit-pytorch
     """
 
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.):
         super().__init__()
         self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, heads, dim_head, dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout))
-            ]))
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.att = Attention(dim, heads, dim_head, dropout)
+        self.ff = FeedForward(dim, mlp_dim, dropout)
 
     def forward(self, x):
-        al = []
-        for attn, ff in self.layers:
-            y, a = attn(x)
-            al.append(a)
-            y = y + x
-            x = ff(y) + x
-        return x, al
+        y = self.norm1(x)
+        y, a = self.att(y)
+        z = y + x
+        y = self.norm2(z)
+        o = self.ff(y) + z
+        return o, a
 
 class MV2Block(nn.Module):
     """MV2 block described in MobileNetV2.
@@ -206,7 +192,9 @@ class MobileViTBlock(nn.Module):
         self.conv1 = conv_nxn_bn(channel, channel, kernel_size)
         self.conv2 = conv_1x1_bn(channel, dim)
 
-        self.transformer = Transformer(dim, depth, 4, 8, mlp_dim, dropout)
+        self.transformer = nn.ModuleList([])
+        for _ in range(depth):
+            self.transformer.append(Transformer(dim, 4, 8, mlp_dim, dropout))
 
         self.conv3 = conv_1x1_bn(dim, channel)
         if channel_out:
@@ -224,7 +212,9 @@ class MobileViTBlock(nn.Module):
         _, _, h, w = x.shape
         x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d',
                       ph=self.ph, pw=self.pw)
-        x, _ = self.transformer(x)
+        for transf in self.transformer:
+            x, _ = transf(x)
+
         x = rearrange(x, 'b (ph pw) (h w) d -> b d (h ph) (w pw)',
                       h=h//self.ph, w=w//self.pw, ph=self.ph, pw=self.pw)
         # Fusion
@@ -243,7 +233,11 @@ class MobileViTBlock_v3(nn.Module):
         self.conv1 = depthconv_nxn_bn(channel, channel, kernel_size)
         self.conv2 = conv_1x1_bn(channel, dim)
         self.ret_att = ret_att
-        self.transformer = Transformer(dim, depth, 4, 8, mlp_dim, dropout)
+
+        self.transformer = nn.ModuleList([])
+        for _ in range(depth):
+            self.transformer.append(Transformer(dim, 4, 8, mlp_dim, dropout))
+
         if channel_out != channel and channel_out > 0:
             self.conv3 = conv_1x1_bn(channel, channel_out)
             self.conv4 = conv_1x1_bn(2 * dim, channel_out)
@@ -259,12 +253,12 @@ class MobileViTBlock_v3(nn.Module):
         # Global representations
         _, _, h, w = x.shape
         z = x.clone() #local rep
+        x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d', ph=self.ph, pw=self.pw)
+        a = []
+        for transf in self.transformer:
+            x, attn = transf(x)
+            a.append(attn)
 
-
-
-        x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d',
-                      ph=self.ph, pw=self.pw)
-        x, attn = self.transformer(x)
         x = rearrange(x, 'b (ph pw) (h w) d -> b d (h ph) (w pw)',
                       h=h//self.ph, w=w//self.pw, ph=self.ph, pw=self.pw)
         # Fusion
@@ -273,7 +267,7 @@ class MobileViTBlock_v3(nn.Module):
         if self.conv3:
             y = self.conv3(y)
         if self.ret_att:
-            return x + y, attn
+            return x + y, a
         else:
             return x + y
 
