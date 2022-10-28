@@ -92,27 +92,23 @@ class FC_attn(nn.Module):
         return self.to_out(out)
 
 class PTransformer(nn.Module):
-    def __init__(self, dim, depth, dim_head, mlp_dim, dropout=0.):
+    def __init__(self, dim, dim_head, mlp_dim, dropout=0.):
         super().__init__()
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                nn.LayerNorm(dim),
-                FC_attn(dim, dim_head, dropout),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout))
-            ]))
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.att = FC_attn(dim, dim_head, dropout)
+        self.ff = FeedForward(dim, mlp_dim, dropout)
 
     def forward(self, x, al):
         """
-        al: List of tensor
+        al: exported attention
         """
-        print(len(al), al[0].shape)
-        for i, (norm, attn, ff) in enumerate(self.layers):
-            y = norm(x)
-            y = attn(y, al[i])
-            y = y + x
-            x = ff(y) + x
-        return x
+        y = self.norm1(x)
+        y = self.att(y, al)
+        z = y + x
+        y = self.norm2(z)
+        o = self.ff(y) + z
+        return o
 
 class Transformer(nn.Module):
     """Transformer block described in ViT.
@@ -122,7 +118,6 @@ class Transformer(nn.Module):
 
     def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.):
         super().__init__()
-        self.layers = nn.ModuleList([])
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.att = Attention(dim, heads, dim_head, dropout)
@@ -279,7 +274,11 @@ class MobileTransViTBlock(nn.Module):
         self.conv1 = depthconv_nxn_bn(channel, channel, kernel_size)
         self.conv2 = conv_1x1_bn(channel, dim)
         dim_head = 64
-        self.transformer = PTransformer(dim, depth, dim_head, mlp_dim, dropout)
+
+        self.transformer = nn.ModuleList([])
+        for _ in range(depth):
+            self.transformer.append(PTransformer(dim, dim_head, mlp_dim, dropout))
+
         if channel_out != channel and channel_out > 0:
             self.conv3 = conv_1x1_bn(channel, channel_out)
             self.conv4 = conv_1x1_bn(2 * dim, channel_out)
@@ -299,7 +298,10 @@ class MobileTransViTBlock(nn.Module):
         z = x.clone() #local rep
         x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d',
                       ph=self.ph, pw=self.pw)
-        x = self.transformer(x, attn)
+
+        for i, transf in enumerate(self.transformer):
+            x = transf(x, attn[i])
+
         x = rearrange(x, 'b (ph pw) (h w) d -> b d (h ph) (w pw)',
                       h=h//self.ph, w=w//self.pw, ph=self.ph, pw=self.pw)
         # Fusion
@@ -396,23 +398,35 @@ def mobilevit_xxs(num_classes):
     channels = [16, 16, 24, 24, 48, 48, 64, 64, 80, 80, 320]
     return MobileViT((256, 256), dims, channels, num_classes=num_classes, expansion=4, with_head=True)
 
+def mobilevit_xs(num_classes):
+    dims = [96, 120, 144]
+    channels = [16, 32, 48, 48, 64, 64, 80, 80, 96, 96, 384]
+    return MobileViT((256, 256), dims, channels, num_classes=num_classes)
+
+def mobilevit_s(num_classes):
+    dims = [144, 192, 240]
+    channels = [16, 32, 64, 64, 96, 96, 128, 128, 160, 160, 640]
+    return MobileViT((256, 256), dims, channels, num_classes=num_classes)
+
 if __name__ == "__main__":
     import time
     from thop import profile
     model = mobilevit_xxs(10)
     input_ = torch.randn((1, 3, 256, 256))
+
     # layers = []
     # layers.append(MV2Block(256, 128, 2))
     # layers.append(MobileViTBlock(96, 2, 256, 3, (2, 2), int(96 * 2), channel_out=128, stride=1))
     # layers.append(MobileViTBlock_v3(96, 2, 256, 3, (2, 2), int(96 * 2)))
     # model = nn.Sequential(*layers)
+
     model_out = model(input_)
+    print(model_out.shape)
     macs, params = profile(model, inputs=(input_,)); print("encoder: macs, params: ", macs/(10**9), params)
     model = model.to('cuda')
     input_ = input_.to('cuda')
-    start = time.time()
+    # start = time.time()
     # for i in range(1000):
     #     model_out = model(input_)
     # m = (time.time() - start) / 1000
     # print("% s seconds" % (m))
-    print(model_out.shape)
